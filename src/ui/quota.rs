@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use super::{btop_block, fmt_age, fmt_tokens, grad_at, make_gradient, remaining_bar, styled_label};
+use super::{btop_block, fmt_tokens, grad_at, make_gradient, remaining_bar, styled_label};
 
 /// Data considered "stale" when its updated_at is older than this many seconds.
 const STALE_SECS: u64 = 600;
@@ -128,32 +128,27 @@ fn draw_source_column(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let ago_secs = rl.updated_at.map(|ts| now.saturating_sub(ts));
-    let is_stale = ago_secs.is_some_and(|s| s > STALE_SECS);
+    let is_stale = rl
+        .updated_at
+        .is_some_and(|ts| now.saturating_sub(ts) > STALE_SECS);
 
-    let fresh_str = ago_secs.map(fmt_age).unwrap_or_default();
-    let fresh_color = if is_stale {
+    // Stale data → dim the source name. Drops the unlabeled "Xs ago" row
+    // we used to render here; keeping a distinct freshness color but no
+    // explicit number is enough to signal "values may be out of date"
+    // without competing with the reset countdown for the user's attention.
+    let source_color = if is_stale {
         theme.inactive_fg
     } else {
-        theme.graph_text
+        theme.title
     };
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         format!(" {}", rl.source.to_uppercase()),
         Style::default()
-            .fg(theme.title)
+            .fg(source_color)
             .add_modifier(Modifier::BOLD),
     )));
-    // Freshness on its own indented line so the full "Ns/m/h/d ago"
-    // string fits without truncation when the column is narrow
-    // (panels share width and the per-column budget is ~10 chars).
-    if !fresh_str.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", fresh_str),
-            Style::default().fg(fresh_color),
-        )));
-    }
 
     if let Some(used_pct) = rl.five_hour_pct {
         let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
@@ -209,7 +204,10 @@ fn draw_source_column(
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Format a reset timestamp as relative time (e.g., "1h 23m")
+/// Format a reset timestamp as a human countdown labeled "in X" so the
+/// row reads as a time-until-reset rather than an ambiguous duration.
+/// When the reset moment is at or in the past, returns the localized
+/// "now" sentinel without the prefix.
 pub(crate) fn format_reset_time(reset_ts: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -219,21 +217,18 @@ pub(crate) fn format_reset_time(reset_ts: u64) -> String {
         return t("quota.now");
     }
     let diff = reset_ts - now;
+    let prefix = t("quota.in");
     if diff < 60 {
-        format!("{}{}", diff, t("time.s"))
+        format!("{} {}{}", prefix, diff, t("time.s"))
     } else if diff < 3600 {
-        format!("{}{}", diff / 60, t("time.m"))
+        format!("{} {}{}", prefix, diff / 60, t("time.m"))
     } else if diff < 86400 {
         let h = diff / 3600;
         let m = (diff % 3600) / 60;
-        let h_label = t("time.h");
-        let m_label = t("time.m");
-        format!("{}{} {}{}", h, h_label, m, m_label)
+        format!("{} {}{} {}{}", prefix, h, t("time.h"), m, t("time.m"))
     } else {
         let d = diff / 86400;
         let h = (diff % 86400) / 3600;
-        let d_label = t("time.d");
-        let h_label = t("time.h");
-        format!("{}{} {}{}", d, d_label, h, h_label)
+        format!("{} {}{} {}{}", prefix, d, t("time.d"), h, t("time.h"))
     }
 }
