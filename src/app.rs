@@ -1,4 +1,5 @@
-use crate::collector::{MultiCollector, read_rate_limits};
+use crate::collector::{read_rate_limits, McpServer, MultiCollector};
+use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -14,15 +15,23 @@ const MAX_SUMMARY_RETRIES: u32 = 2;
 
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
-    let cleaned: String = prompt.chars()
+    prompt
+        .chars()
         .filter(|c| !c.is_control() || *c == ' ')
         .take(max_len)
-        .collect();
-    if prompt.chars().count() > max_len {
-        format!("{}…", cleaned)
-    } else {
-        cleaned
-    }
+        .collect()
+}
+
+/// Outcome of an Enter-key jump attempt. Distinct from `Option<String>` so
+/// callers (notably `--exit-on-jump`) can tell a real tmux jump apart from
+/// a no-op (outside tmux, or empty session list).
+pub enum JumpOutcome {
+    /// Actually switched to a tmux pane.
+    Jumped,
+    /// Tried to jump in tmux but no pane owns the session's PID.
+    Failed(String),
+    /// Not in tmux, or nothing selected — nothing happened.
+    NoOp,
 }
 
 pub struct App {
@@ -55,13 +64,50 @@ pub struct App {
     /// Kill confirmation: (selected_index, timestamp). Expires after 2s.
     kill_confirm: Option<(usize, Instant)>,
     pub theme: Theme,
+    pub show_context: bool,
+    pub show_quota: bool,
+    pub show_tokens: bool,
+    pub show_projects: bool,
+    pub show_ports: bool,
+    pub show_sessions: bool,
+    pub show_mcp: bool,
+    /// MCP servers detected on the most recent tick (sourced from
+    /// MultiCollector). Populated regardless of `show_mcp` so panel
+    /// toggling doesn't cost a discovery roundtrip.
+    pub mcp_servers: Vec<McpServer>,
+    /// When true (default), mcp-server-owned rollouts are hidden from
+    /// the sessions panel. Toggle with Shift+M.
+    pub mcp_suppress_sessions: bool,
+    pub config_open: bool,
+    pub config_selected: usize,
+    pub tree_view: bool,
+    pub filter_text: String,
+    pub filter_active: bool,
+    pub show_timeline: bool,
+    pub timeline_scroll: usize,
+    pub show_file_audit: bool,
+    /// Host vitals sampler (CPU% delta needs prior snapshot).
+    host_sampler: HostSampler,
+    /// Latest host metrics snapshot (None until first valid sample).
+    pub host_metrics: Option<HostMetrics>,
+    /// Aggregate metrics across all sessions (recomputed each tick).
+    pub agent_aggregate: AgentAggregate,
+    /// Help overlay (`?`) visibility.
+    pub help_open: bool,
+    /// View leader overlay (`v`) visibility.
+    pub view_open: bool,
 }
 
 impl App {
-    pub fn new(theme: Theme) -> Self {
+    pub fn new_with_config(
+        theme: Theme,
+        hidden_agents: &[String],
+        panels: crate::config::PanelVisibility,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
-        // Load cached summaries from disk
         let summaries = load_summary_cache();
+        let mut collector = MultiCollector::with_hidden(hidden_agents);
+        collector.set_mcp_suppress(true);
         Self {
             sessions: Vec::new(),
             selected: 0,
@@ -69,8 +115,8 @@ impl App {
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             rate_limits: Vec::new(),
             prev_tokens: HashMap::new(),
-            rate_limit_counter: 5, // trigger on first tick
-            collector: MultiCollector::new(),
+            rate_limit_counter: 5,
+            collector,
             summaries,
             pending_summaries: HashSet::new(),
             summary_retries: HashMap::new(),
@@ -80,12 +126,142 @@ impl App {
             status_msg: None,
             kill_confirm: None,
             theme,
+            show_context: panels.context,
+            show_quota: panels.quota,
+            show_tokens: panels.tokens,
+            show_projects: panels.projects,
+            show_ports: panels.ports,
+            show_sessions: panels.sessions,
+            show_mcp: panels.mcp,
+            mcp_servers: Vec::new(),
+            mcp_suppress_sessions: true,
+            config_open: false,
+            config_selected: 0,
+            tree_view: false,
+            filter_text: String::new(),
+            filter_active: false,
+            show_timeline: false,
+            timeline_scroll: 0,
+            show_file_audit: false,
+            host_sampler: HostSampler::new(),
+            host_metrics: None,
+            agent_aggregate: AgentAggregate::default(),
+            help_open: false,
+            view_open: false,
         }
+    }
+
+    pub fn toggle_help(&mut self) {
+        self.help_open = !self.help_open;
+        if self.help_open {
+            self.view_open = false;
+        }
+    }
+
+    pub fn toggle_view_menu(&mut self) {
+        self.view_open = !self.view_open;
+        if self.view_open {
+            self.help_open = false;
+        }
+    }
+
+    pub fn toggle_panel(&mut self, panel: u8) {
+        match panel {
+            1 => self.show_context = !self.show_context,
+            2 => self.show_quota = !self.show_quota,
+            3 => self.show_tokens = !self.show_tokens,
+            4 => self.show_projects = !self.show_projects,
+            5 => self.show_ports = !self.show_ports,
+            6 => self.show_sessions = !self.show_sessions,
+            7 => self.show_mcp = !self.show_mcp,
+            _ => return,
+        }
+        self.persist_panel_visibility();
+    }
+
+    /// Toggle whether mcp-server-owned rollouts are hidden from the
+    /// sessions panel. Default is on; turning it off restores upstream
+    /// behavior so the user can see exactly what mcp-server fd holding
+    /// produces (mostly stale "Done" rows).
+    pub fn toggle_mcp_session_suppression(&mut self) {
+        self.mcp_suppress_sessions = !self.mcp_suppress_sessions;
+        let label = if self.mcp_suppress_sessions {
+            "on"
+        } else {
+            "off"
+        };
+        self.set_status(format!("mcp session suppression: {}", label));
+    }
+
+    fn persist_panel_visibility(&mut self) {
+        let panels = crate::config::PanelVisibility {
+            context: self.show_context,
+            quota: self.show_quota,
+            tokens: self.show_tokens,
+            projects: self.show_projects,
+            ports: self.show_ports,
+            sessions: self.show_sessions,
+            mcp: self.show_mcp,
+        };
+        if let Err(e) = crate::config::save_panel_visibility(&panels) {
+            self.set_status(format!("panels save failed: {}", e));
+        }
+    }
+
+    pub fn toggle_file_audit(&mut self) {
+        self.show_file_audit = !self.show_file_audit;
+    }
+
+    pub fn toggle_config(&mut self) {
+        self.config_open = !self.config_open;
+        if self.config_open {
+            self.config_selected = 0;
+        }
+    }
+
+    pub fn config_item_count(&self) -> usize {
+        8 // theme + 7 panel toggles
+    }
+
+    pub fn config_select_next(&mut self) {
+        if self.config_selected + 1 < self.config_item_count() {
+            self.config_selected += 1;
+        }
+    }
+
+    pub fn config_select_prev(&mut self) {
+        self.config_selected = self.config_selected.saturating_sub(1);
+    }
+
+    pub fn config_toggle_selected(&mut self) {
+        match self.config_selected {
+            0 => {
+                self.cycle_theme();
+                return;
+            }
+            1 => self.show_context = !self.show_context,
+            2 => self.show_quota = !self.show_quota,
+            3 => self.show_tokens = !self.show_tokens,
+            4 => self.show_projects = !self.show_projects,
+            5 => self.show_ports = !self.show_ports,
+            6 => self.show_sessions = !self.show_sessions,
+            7 => self.show_mcp = !self.show_mcp,
+            _ => return,
+        }
+        self.persist_panel_visibility();
+    }
+
+    pub fn toggle_timeline(&mut self) {
+        self.show_timeline = !self.show_timeline;
+        self.timeline_scroll = 0;
     }
 
     pub fn cycle_theme(&mut self) {
         let names = crate::theme::THEME_NAMES;
-        let current = names.iter().position(|&n| n == self.theme.name).unwrap_or(0);
+        let current = names
+            .iter()
+            .position(|&n| n == self.theme.name)
+            .unwrap_or(0);
         let next = (current + 1) % names.len();
         self.theme = Theme::by_name(names[next]).unwrap_or_default();
         if let Err(e) = crate::config::save_theme(names[next]) {
@@ -100,13 +276,17 @@ impl App {
         self.status_msg = Some((msg, Instant::now()));
     }
 
-
     pub fn tick(&mut self) {
+        self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
         self.sessions = self.collector.collect();
         self.orphan_ports = self.collector.orphan_ports.clone();
+        self.mcp_servers = self.collector.mcp_servers.clone();
+        self.host_metrics = self.host_sampler.sample();
+        self.agent_aggregate = AgentAggregate::from_sessions(&self.sessions);
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
         }
+        self.clamp_selection_to_visible();
 
         // Compute rate as sum of per-session deltas (stable across session churn).
         // Update prev_tokens in place; stale entries are harmless (bounded by
@@ -129,12 +309,15 @@ impl App {
         // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
         if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
             self.rate_limit_counter = 0;
-            self.rate_limits = read_rate_limits();
+            let extra_dirs = self.collector.all_config_dirs();
+            self.rate_limits = read_rate_limits(&extra_dirs);
             // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
             self.rate_limits.extend(self.collector.agent_rate_limits());
         } else {
             self.rate_limit_counter += 1;
         }
+
+        promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
 
         self.drain_and_retry_summaries();
     }
@@ -155,7 +338,7 @@ impl App {
                     *count += 1;
                     if *count >= MAX_SUMMARY_RETRIES {
                         // Exhausted — store sanitized fallback using prompt from worker
-                        self.summaries.insert(sid, sanitize_fallback(&prompt, 28));
+                        self.summaries.insert(sid, sanitize_fallback(&prompt, 80));
                         save_summary_cache(&self.summaries);
                     }
                 }
@@ -164,7 +347,11 @@ impl App {
 
         // Spawn summary jobs for sessions that need one
         for s in &self.sessions {
-            let retries = self.summary_retries.get(&s.session_id).copied().unwrap_or(0);
+            let retries = self
+                .summary_retries
+                .get(&s.session_id)
+                .copied()
+                .unwrap_or(0);
             let has_input = !s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty();
             if has_input
                 && !self.summaries.contains_key(&s.session_id)
@@ -179,7 +366,11 @@ impl App {
                 let tx = self.summary_tx.clone();
                 std::thread::spawn(move || {
                     let result = generate_summary(&prompt, &assistant_text);
-                    let fallback_text = if prompt.is_empty() { assistant_text } else { prompt };
+                    let fallback_text = if prompt.is_empty() {
+                        assistant_text
+                    } else {
+                        prompt
+                    };
                     let _ = tx.send((sid, fallback_text, result));
                 });
             }
@@ -196,18 +387,91 @@ impl App {
             (!s.initial_prompt.is_empty() || !s.first_assistant_text.is_empty())
                 && !self.summaries.contains_key(&s.session_id)
                 && !self.pending_summaries.contains(&s.session_id)
-                && self.summary_retries.get(&s.session_id).copied().unwrap_or(0) < MAX_SUMMARY_RETRIES
+                && self
+                    .summary_retries
+                    .get(&s.session_id)
+                    .copied()
+                    .unwrap_or(0)
+                    < MAX_SUMMARY_RETRIES
         })
     }
 
+    /// Returns indices of sessions matching the current filter.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        if self.filter_text.is_empty() {
+            return (0..self.sessions.len()).collect();
+        }
+        let query = self.filter_text.to_lowercase();
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| Self::session_matches(s, &query))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn session_matches(s: &AgentSession, query: &str) -> bool {
+        s.project_name.to_lowercase().contains(query)
+            || s.model.to_lowercase().contains(query)
+            || s.session_id.to_lowercase().contains(query)
+            || s.initial_prompt.to_lowercase().contains(query)
+            || s.cwd.to_lowercase().contains(query)
+            || format!("{:?}", s.status).to_lowercase().contains(query)
+    }
+
+    /// Ensure `selected` points to a session included in the current filter.
+    /// No-op when no sessions match; otherwise snaps to the first visible.
+    fn clamp_selection_to_visible(&mut self) {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        if !visible.contains(&self.selected) {
+            self.selected = visible[0];
+        }
+    }
+
+    pub fn filter_push(&mut self, c: char) {
+        self.filter_text.push(c);
+        self.clamp_selection_to_visible();
+    }
+
+    pub fn filter_pop(&mut self) {
+        self.filter_text.pop();
+        self.clamp_selection_to_visible();
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter_active = false;
+        self.filter_text.clear();
+    }
+
     pub fn select_next(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = (self.selected + 1).min(self.sessions.len() - 1);
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
+            if pos + 1 < visible.len() {
+                self.selected = visible[pos + 1];
+            }
+        } else {
+            self.selected = visible[0];
         }
     }
 
     pub fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        if let Some(pos) = visible.iter().position(|&i| i == self.selected) {
+            if pos > 0 {
+                self.selected = visible[pos - 1];
+            }
+        } else {
+            self.selected = *visible.last().unwrap();
+        }
     }
 
     pub fn kill_selected(&mut self) {
@@ -247,7 +511,9 @@ impl App {
         }
 
         // First press — ask for confirmation
-        let name = self.summaries.get(&session.session_id)
+        let name = self
+            .summaries
+            .get(&session.session_id)
             .cloned()
             .unwrap_or_else(|| format!("PID {}", session.pid));
         self.kill_confirm = Some((self.selected, Instant::now()));
@@ -265,7 +531,8 @@ impl App {
 
         for orphan in &self.orphan_ports {
             // 1. Verify PID still listens on the expected port
-            let still_listening = fresh_ports.get(&orphan.pid)
+            let still_listening = fresh_ports
+                .get(&orphan.pid)
                 .is_some_and(|ports| ports.contains(&orphan.port));
             if !still_listening {
                 continue;
@@ -292,26 +559,29 @@ impl App {
     }
 
     /// Jump to the terminal running the selected session's Claude process.
-    /// In tmux: switch to the pane. Otherwise: show a helpful status message.
-    pub fn jump_to_session(&mut self) -> Option<String> {
+    /// In tmux: switch to the pane. Otherwise: no-op.
+    pub fn jump_to_session(&mut self) -> JumpOutcome {
         if self.sessions.is_empty() {
-            return None;
+            return JumpOutcome::NoOp;
         }
-        let session = &self.sessions[self.selected];
-        let target_pid = session.pid;
-
-        // tmux: actual jump
-        if std::env::var("TMUX").is_ok() {
-            return self.jump_via_tmux(target_pid);
+        if std::env::var("TMUX").is_err() {
+            return JumpOutcome::NoOp;
         }
-
-        // No tmux: no action
-        None
+        let target_pid = self.sessions[self.selected].pid;
+        match self.jump_via_tmux(target_pid) {
+            None => JumpOutcome::Jumped,
+            Some(msg) => JumpOutcome::Failed(msg),
+        }
     }
 
     fn jump_via_tmux(&self, target_pid: u32) -> Option<String> {
         let output = std::process::Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{pane_pid} #{session_name}:#{window_index}.#{pane_index}"])
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_pid} #{session_name}:#{window_index}.#{pane_index}",
+            ])
             .output()
             .ok()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -357,9 +627,9 @@ impl App {
         } else if matches!(session.status, SessionStatus::Done) {
             // Done sessions: don't wait for pending summary, show fallback immediately
             if !session.initial_prompt.is_empty() {
-                sanitize_fallback(&session.initial_prompt, 28)
+                sanitize_fallback(&session.initial_prompt, 80)
             } else if !session.first_assistant_text.is_empty() {
-                sanitize_fallback(&session.first_assistant_text, 28)
+                sanitize_fallback(&session.first_assistant_text, 80)
             } else {
                 "—".to_string()
             }
@@ -368,16 +638,19 @@ impl App {
             let dots = match (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() / 500) % 3 {
+                .as_millis()
+                / 500)
+                % 3
+            {
                 0 => ".",
                 1 => "..",
                 _ => "...",
             };
             dots.to_string()
         } else if !session.initial_prompt.is_empty() {
-            sanitize_fallback(&session.initial_prompt, 28)
+            sanitize_fallback(&session.initial_prompt, 80)
         } else if !session.first_assistant_text.is_empty() {
-            sanitize_fallback(&session.first_assistant_text, 28)
+            sanitize_fallback(&session.first_assistant_text, 80)
         } else {
             "—".to_string()
         }
@@ -396,7 +669,10 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
     let assistant_part: String = assistant_text.chars().take(200).collect();
 
     let context = if !user_part.is_empty() && !assistant_part.is_empty() {
-        format!("User message: {}\n\nAssistant response: {}", user_part, assistant_part)
+        format!(
+            "User message: {}\n\nAssistant response: {}",
+            user_part, assistant_part
+        )
     } else if !assistant_part.is_empty() {
         format!("Assistant response: {}", assistant_part)
     } else {
@@ -417,7 +693,7 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
         .spawn()
     {
         Ok(c) => c,
-        Err(_) => return Some(sanitize_fallback(prompt, 28)),
+        Err(_) => return Some(sanitize_fallback(prompt, 80)),
     };
 
     // Write prompt via stdin (no shell injection)
@@ -444,17 +720,15 @@ fn generate_summary(prompt: &str, assistant_text: &str) -> Option<String> {
         }
     };
 
-    let fallback = sanitize_fallback(prompt, 28);
+    let fallback = sanitize_fallback(prompt, 80);
 
     match result {
         Ok(output) if output.status.success() => {
-            let raw = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string();
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let lower = raw.to_lowercase();
             // Reject empty, too long, generic, or prompt-echo outputs
             if raw.is_empty()
-                || raw.chars().count() > 40
+                || raw.chars().count() > 80
                 || raw.contains("Summarize")
                 || raw.starts_with("- ")
                 || lower.contains("new conversation")
@@ -489,9 +763,9 @@ fn load_summary_cache() -> HashMap<String, String> {
         Ok(content) => {
             let mut cache: HashMap<String, String> =
                 serde_json::from_str(&content).unwrap_or_default();
-            // Purge entries polluted by generate_summary's own claude --print calls
+            // Purge polluted or old truncated-fallback entries so they regenerate
             let before = cache.len();
-            cache.retain(|_, v| !v.contains("You are a conversation tit"));
+            cache.retain(|_, v| !v.contains("You are a conversation tit") && !v.ends_with('…'));
             if cache.len() < before {
                 // Persist cleaned cache
                 let _ = std::fs::create_dir_all(cache_dir());
@@ -554,5 +828,116 @@ fn save_summary_cache(summaries: &HashMap<String, String>) {
         if std::fs::write(&tmp, &json).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
+    }
+}
+
+/// Threshold above which a rate-limited bucket is surfaced as RateLimited
+/// in the session list. 90% leaves enough headroom to catch near-saturation
+/// before the account actually blocks.
+const RATE_LIMITED_PCT: f64 = 90.0;
+
+/// Promote Waiting sessions to RateLimited when a rate limit from the SAME
+/// agent CLI is over `RATE_LIMITED_PCT`. Matching on source avoids a
+/// Claude-only saturation freezing Codex sessions and vice versa.
+fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &[RateLimitInfo]) {
+    if rate_limits.is_empty() {
+        return;
+    }
+    for s in sessions.iter_mut() {
+        if s.status != SessionStatus::Waiting {
+            continue;
+        }
+        let over = rate_limits.iter().any(|rl| {
+            rl.source == s.agent_cli
+                && (rl.five_hour_pct.unwrap_or(0.0) > RATE_LIMITED_PCT
+                    || rl.seven_day_pct.unwrap_or(0.0) > RATE_LIMITED_PCT)
+        });
+        if over {
+            s.status = SessionStatus::RateLimited;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waiting_session(cli: &'static str) -> AgentSession {
+        AgentSession {
+            agent_cli: cli,
+            pid: 1,
+            session_id: String::new(),
+            cwd: String::new(),
+            project_name: String::new(),
+            started_at: 0,
+            status: SessionStatus::Waiting,
+            model: String::new(),
+            effort: String::new(),
+            context_percent: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 0,
+            compaction_count: 0,
+            current_tasks: vec![],
+            version: String::new(),
+            git_branch: String::new(),
+            mem_mb: 0,
+            token_history: vec![],
+            context_history: vec![],
+            context_window: 0,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
+            git_added: 0,
+            git_modified: 0,
+        }
+    }
+
+    fn rate_limit(source: &str, pct: f64) -> RateLimitInfo {
+        RateLimitInfo {
+            source: source.to_string(),
+            five_hour_pct: Some(pct),
+            five_hour_resets_at: None,
+            seven_day_pct: None,
+            seven_day_resets_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_is_per_agent_cli() {
+        // Claude is saturated, Codex is not. Only the Claude session should
+        // be promoted.
+        let mut sessions = vec![waiting_session("claude"), waiting_session("codex")];
+        let limits = vec![rate_limit("claude", 95.0)];
+        promote_waiting_to_rate_limited(&mut sessions, &limits);
+        assert_eq!(sessions[0].status, SessionStatus::RateLimited);
+        assert_eq!(sessions[1].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_ignores_below_threshold() {
+        let mut sessions = vec![waiting_session("claude")];
+        let limits = vec![rate_limit("claude", 89.9)];
+        promote_waiting_to_rate_limited(&mut sessions, &limits);
+        assert_eq!(sessions[0].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_skips_non_waiting_sessions() {
+        let mut sessions = vec![waiting_session("claude")];
+        sessions[0].status = SessionStatus::Thinking;
+        let limits = vec![rate_limit("claude", 99.0)];
+        promote_waiting_to_rate_limited(&mut sessions, &limits);
+        assert_eq!(sessions[0].status, SessionStatus::Thinking);
     }
 }

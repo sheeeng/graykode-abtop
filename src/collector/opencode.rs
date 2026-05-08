@@ -87,14 +87,14 @@ impl OpenCodeCollector {
             } else {
                 let since_update_secs = age_ms / 1000;
                 if since_update_secs < 30 {
-                    SessionStatus::Working
+                    SessionStatus::Thinking
                 } else {
                     let cpu_active = proc.is_some_and(|p| p.cpu_pct > 1.0);
                     let has_active_child = matched_pid.is_some_and(|p| {
                         process::has_active_descendant(p, &shared.children_map, &shared.process_info, 5.0)
                     });
                     if cpu_active || has_active_child {
-                        SessionStatus::Working
+                        SessionStatus::Thinking
                     } else {
                         SessionStatus::Waiting
                     }
@@ -169,12 +169,19 @@ impl OpenCodeCollector {
                 git_added: 0,
                 git_modified: 0,
                 token_history: vec![],
+                context_history: vec![],
+                compaction_count: 0,
+                context_window: 0,
                 subagents: vec![],
                 mem_file_count: 0,
                 mem_line_count: 0,
                 children,
                 initial_prompt: ds.title,
                 first_assistant_text: String::new(),
+                tool_calls: vec![],
+                pending_since_ms: 0,
+                thinking_since_ms: 0,
+                file_accesses: vec![],
             });
         }
 

@@ -1,5 +1,36 @@
 use serde::Deserialize;
+use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Type of file operation performed by the agent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileOp {
+    Read,
+    Write,
+    Edit,
+}
+
+impl fmt::Display for FileOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FileOp::Read => write!(f, "R"),
+            FileOp::Write => write!(f, "W"),
+            FileOp::Edit => write!(f, "E"),
+        }
+    }
+}
+
+/// A single file access event recorded from agent tool usage.
+#[derive(Debug, Clone)]
+pub struct FileAccess {
+    pub path: String,
+    pub operation: FileOp,
+    #[allow(dead_code)]
+    pub turn_index: u32,
+}
+
+/// Maximum file access entries kept per session to bound memory.
+pub const MAX_FILE_ACCESSES: usize = 1000;
 
 /// Account-level rate limit info (shared across all sessions).
 #[derive(Debug, Clone, Default)]
@@ -20,9 +51,23 @@ pub struct RateLimitInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
-    Working,
+    /// Model is generating a response (last_user_ts_ms > 0)
+    Thinking,
+    /// Running a tool (descendant CPU active OR current_task non-empty)
+    Executing,
+    /// Idle, waiting for user input or permission prompt
     Waiting,
+    /// Waiting due to rate limit
+    RateLimited,
+    /// Session finished
     Done,
+}
+
+impl SessionStatus {
+    /// Returns true for states where the agent is actively doing work.
+    pub fn is_active(&self) -> bool {
+        matches!(self, SessionStatus::Thinking | SessionStatus::Executing)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,9 +94,22 @@ pub struct SubAgent {
     pub tokens: u64,
 }
 
+/// A single tool invocation from a session transcript.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    /// Tool name: "Read", "Edit", "Bash", "Write", "Grep", "Glob", "Agent", etc.
+    pub name: String,
+    /// Short argument (file path, command prefix, pattern).
+    pub arg: String,
+    /// Duration in milliseconds (0 if unknown).
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     /// Which CLI tool this session belongs to: "claude", "codex", etc.
+    /// Also used as the identifier for the `hidden_agents` config key
+    /// (case-insensitive match).
     pub agent_cli: &'static str,
     pub pid: u32,
     pub session_id: String,
@@ -76,6 +134,12 @@ pub struct AgentSession {
     pub git_added: u32,
     pub git_modified: u32,
     pub token_history: Vec<u64>,
+    /// Per-turn context size (input tokens) for context evolution visualization.
+    pub context_history: Vec<u64>,
+    /// Number of detected compaction events (context dropped > 30% between turns).
+    pub compaction_count: u32,
+    /// Context window size for this session's model (e.g. 200K, 1M).
+    pub context_window: u64,
     pub subagents: Vec<SubAgent>,
     pub mem_file_count: u32,
     pub mem_line_count: u32,
@@ -84,11 +148,28 @@ pub struct AgentSession {
     pub initial_prompt: String,
     /// First assistant response text (text blocks only) — used as summary fallback
     pub first_assistant_text: String,
+    /// Timeline of tool calls extracted from transcript.
+    pub tool_calls: Vec<ToolCall>,
+    /// Unix-epoch ms of the assistant turn whose `tool_use` blocks are still
+    /// awaiting the matching `user` response. Zero when the latest assistant
+    /// turn has already been closed (no tools currently in flight).
+    /// Used to animate the timeline bar for the running tool(s).
+    pub pending_since_ms: u64,
+    /// Unix-epoch ms of the most recent `user` line (prompt or tool_result)
+    /// that has not yet been followed by an assistant response. Zero when
+    /// the last transcript entry was an assistant turn. Used to render a
+    /// live "Thinking" row while the model is generating its next reply.
+    pub thinking_since_ms: u64,
+    /// File access audit log: every file read/written/edited by the agent.
+    pub file_accesses: Vec<FileAccess>,
 }
 
 impl AgentSession {
     pub fn total_tokens(&self) -> u64 {
-        self.total_input_tokens + self.total_output_tokens + self.total_cache_read + self.total_cache_create
+        self.total_input_tokens
+            + self.total_output_tokens
+            + self.total_cache_read
+            + self.total_cache_create
     }
 
     /// Tokens that represent new work (input + output), excluding cache hits.
@@ -175,12 +256,19 @@ mod tests {
             git_added: 0,
             git_modified: 0,
             token_history: Vec::new(),
+            context_history: Vec::new(),
+            compaction_count: 0,
+            context_window: 0,
             subagents: Vec::new(),
             mem_file_count: 0,
             mem_line_count: 0,
             children: Vec::new(),
             initial_prompt: String::new(),
             first_assistant_text: String::new(),
+            tool_calls: Vec::new(),
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: Vec::new(),
         }
     }
 

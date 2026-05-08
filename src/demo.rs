@@ -1,5 +1,8 @@
 use crate::app::App;
-use crate::model::{AgentSession, ChildProcess, OrphanPort, RateLimitInfo, SessionStatus, SubAgent};
+use crate::model::{
+    AgentSession, ChildProcess, FileAccess, FileOp, OrphanPort, RateLimitInfo, SessionStatus,
+    SubAgent, ToolCall,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
@@ -25,7 +28,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/webshop".into(),
             project_name: "webshop".into(),
             started_at: now - 2 * 3600 * 1000, // 2h ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Executing,
             model: "claude-opus-4-6".into(),
             effort: String::new(),
             context_percent: 72.0,
@@ -41,12 +44,19 @@ pub fn populate_demo(app: &mut App) {
             git_added: 2,
             git_modified: 8,
             token_history: vec![
-                18000, 22000, 45000, 38000, 52000, 41000, 35000, 28000,
-                61000, 55000, 48000, 39000, 44000, 50000, 32000, 27000,
-                58000, 46000, 42000, 36000, 53000, 47000, 41000, 38000,
-                62000, 55000, 49000, 43000, 51000, 44000, 38000, 33000,
-                56000, 48000,
+                18000, 22000, 45000, 38000, 52000, 41000, 35000, 28000, 61000, 55000, 48000, 39000,
+                44000, 50000, 32000, 27000, 58000, 46000, 42000, 36000, 53000, 47000, 41000, 38000,
+                62000, 55000, 49000, 43000, 51000, 44000, 38000, 33000, 56000, 48000,
             ],
+            context_history: vec![
+                20000, 35000, 52000, 68000, 85000, 102000, 118000, 135000, 148000, 162000, 175000,
+                185000, 192000, // compaction event: 192k -> 65k (66% drop)
+                65000, 78000, 92000, 108000, 125000, 138000, 145000, 155000, 168000, 178000,
+                185000, 190000, // second compaction: 190k -> 58k
+                58000, 72000, 88000, 105000, 120000, 135000, 142000, 148000,
+            ],
+            compaction_count: 2,
+            context_window: 200_000,
             subagents: vec![
                 SubAgent {
                     name: "Explore test coverage".into(),
@@ -80,6 +90,148 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Implement Stripe payment integration for checkout flow".into(),
+            tool_calls: vec![
+                ToolCall {
+                    name: "Read".into(),
+                    arg: "src/checkout/mod.rs".into(),
+                    duration_ms: 85,
+                },
+                ToolCall {
+                    name: "Read".into(),
+                    arg: "Cargo.toml".into(),
+                    duration_ms: 42,
+                },
+                ToolCall {
+                    name: "Bash".into(),
+                    arg: "cargo add stripe-rust".into(),
+                    duration_ms: 3200,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/checkout/payment.rs".into(),
+                    duration_ms: 120,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/checkout/mod.rs".into(),
+                    duration_ms: 95,
+                },
+                ToolCall {
+                    name: "Write".into(),
+                    arg: "src/checkout/stripe.rs".into(),
+                    duration_ms: 180,
+                },
+                ToolCall {
+                    name: "Bash".into(),
+                    arg: "cargo test".into(),
+                    duration_ms: 8400,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/checkout/stripe.rs".into(),
+                    duration_ms: 110,
+                },
+                ToolCall {
+                    name: "Bash".into(),
+                    arg: "cargo test checkout".into(),
+                    duration_ms: 4200,
+                },
+                ToolCall {
+                    name: "Read".into(),
+                    arg: "src/config.rs".into(),
+                    duration_ms: 55,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/config.rs".into(),
+                    duration_ms: 90,
+                },
+                ToolCall {
+                    name: "Grep".into(),
+                    arg: "STRIPE_SECRET".into(),
+                    duration_ms: 320,
+                },
+                ToolCall {
+                    name: "Agent".into(),
+                    arg: "security review".into(),
+                    duration_ms: 12400,
+                },
+                ToolCall {
+                    name: "Bash".into(),
+                    arg: "cargo clippy".into(),
+                    duration_ms: 5100,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/checkout/payment.rs".into(),
+                    duration_ms: 145,
+                },
+                ToolCall {
+                    name: "Bash".into(),
+                    arg: "cargo test".into(),
+                    duration_ms: 7800,
+                },
+                // Currently running: timeline bar grows in real time.
+                ToolCall {
+                    name: "WebSearch".into(),
+                    arg: "stripe webhook best practice".into(),
+                    duration_ms: 0,
+                },
+            ],
+            pending_since_ms: now - 6_000, // 6s ago => bar animates
+            thinking_since_ms: 0,
+            file_accesses: vec![
+                FileAccess {
+                    path: "src/checkout/payment.rs".into(),
+                    operation: FileOp::Read,
+                    turn_index: 2,
+                },
+                FileAccess {
+                    path: "src/checkout/mod.rs".into(),
+                    operation: FileOp::Read,
+                    turn_index: 3,
+                },
+                FileAccess {
+                    path: "src/checkout/payment.rs".into(),
+                    operation: FileOp::Edit,
+                    turn_index: 5,
+                },
+                FileAccess {
+                    path: "src/config/stripe.rs".into(),
+                    operation: FileOp::Write,
+                    turn_index: 7,
+                },
+                FileAccess {
+                    path: "src/checkout/payment.rs".into(),
+                    operation: FileOp::Edit,
+                    turn_index: 10,
+                },
+                FileAccess {
+                    path: "tests/checkout_test.rs".into(),
+                    operation: FileOp::Write,
+                    turn_index: 12,
+                },
+                FileAccess {
+                    path: "src/models/order.rs".into(),
+                    operation: FileOp::Read,
+                    turn_index: 15,
+                },
+                FileAccess {
+                    path: "src/checkout/payment.rs".into(),
+                    operation: FileOp::Edit,
+                    turn_index: 18,
+                },
+                FileAccess {
+                    path: "Cargo.toml".into(),
+                    operation: FileOp::Read,
+                    turn_index: 20,
+                },
+                FileAccess {
+                    path: "tests/checkout_test.rs".into(),
+                    operation: FileOp::Edit,
+                    turn_index: 22,
+                },
+            ],
         },
         AgentSession {
             agent_cli: "claude",
@@ -104,11 +256,17 @@ pub fn populate_demo(app: &mut App) {
             git_added: 1,
             git_modified: 4,
             token_history: vec![
-                32000, 28000, 41000, 55000, 62000, 48000, 35000, 29000,
-                44000, 58000, 51000, 39000, 46000, 53000, 42000, 37000,
-                60000, 52000, 45000, 38000, 56000, 49000, 43000, 36000,
+                32000, 28000, 41000, 55000, 62000, 48000, 35000, 29000, 44000, 58000, 51000, 39000,
+                46000, 53000, 42000, 37000, 60000, 52000, 45000, 38000, 56000, 49000, 43000, 36000,
                 63000, 57000, 50000, 44000, 54000, 47000,
             ],
+            context_history: vec![
+                15000, 28000, 45000, 62000, 80000, 95000, 112000, 128000, 142000, 158000, 172000,
+                182000, 190000, 195000, // compaction: 195k -> 70k
+                70000, 85000, 98000, 115000, 130000, 145000, 158000, 170000, 182000,
+            ],
+            compaction_count: 1,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 2,
             mem_line_count: 8,
@@ -116,6 +274,10 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Add batch inference endpoint with GPU scheduling".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "claude",
@@ -124,7 +286,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/api-server".into(),
             project_name: "api-server".into(),
             started_at: now - 15 * 60 * 1000, // 15m ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Executing,
             model: "claude-haiku-4-5".into(),
             effort: String::new(),
             context_percent: 42.0,
@@ -140,9 +302,11 @@ pub fn populate_demo(app: &mut App) {
             git_added: 0,
             git_modified: 2,
             token_history: vec![
-                8000, 12000, 15000, 22000, 18000, 25000, 20000, 16000,
-                28000, 24000, 19000, 14000,
+                8000, 12000, 15000, 22000, 18000, 25000, 20000, 16000, 28000, 24000, 19000, 14000,
             ],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 1,
             mem_line_count: 3,
@@ -169,6 +333,44 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Fix CORS headers and add rate limiting middleware".into(),
+            tool_calls: vec![
+                ToolCall {
+                    name: "Read".into(),
+                    arg: "src/server.ts".into(),
+                    duration_ms: 60,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/middleware/cors.ts".into(),
+                    duration_ms: 150,
+                },
+                ToolCall {
+                    name: "Write".into(),
+                    arg: "src/middleware/rate-limit.ts".into(),
+                    duration_ms: 200,
+                },
+                ToolCall {
+                    name: "Bash".into(),
+                    arg: "npm test".into(),
+                    duration_ms: 2800,
+                },
+                ToolCall {
+                    name: "Edit".into(),
+                    arg: "src/server.ts".into(),
+                    duration_ms: 110,
+                },
+                ToolCall {
+                    name: "Bash".into(),
+                    arg: "npm run dev".into(),
+                    duration_ms: 1500,
+                },
+            ],
+            pending_since_ms: 0,
+            // Model is generating its next reply - virtual "Thinking" row
+            // animates. 1s offset keeps the bar visibly growing against the
+            // session's 2.8s max tool duration before it caps at 100%.
+            thinking_since_ms: now - 1_000,
+            file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "codex",
@@ -177,7 +379,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/data-viz".into(),
             project_name: "data-viz".into(),
             started_at: now - 5 * 60 * 1000, // 5m ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Thinking,
             model: "gpt-5.4".into(),
             effort: "medium".into(),
             context_percent: 18.0,
@@ -192,23 +394,26 @@ pub fn populate_demo(app: &mut App) {
             git_branch: "feat/heatmap".into(),
             git_added: 3,
             git_modified: 1,
-            token_history: vec![
-                5000, 8000, 12000, 18000, 15000, 22000,
-            ],
+            token_history: vec![5000, 8000, 12000, 18000, 15000, 22000],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
-            children: vec![
-                ChildProcess {
-                    pid: 8950,
-                    command: "python -m http.server 8080".into(),
-                    mem_kb: 32_000,
-                    port: Some(8080),
-                },
-            ],
+            children: vec![ChildProcess {
+                pid: 8950,
+                command: "python -m http.server 8080".into(),
+                mem_kb: 32_000,
+                port: Some(8080),
+            }],
 
             first_assistant_text: String::new(),
             initial_prompt: "Create interactive heatmap component with D3.js".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
         },
         AgentSession {
             agent_cli: "opencode",
@@ -217,7 +422,7 @@ pub fn populate_demo(app: &mut App) {
             cwd: "/Users/demo/infra".into(),
             project_name: "infra".into(),
             started_at: now - 8 * 60 * 1000, // 8m ago
-            status: SessionStatus::Working,
+            status: SessionStatus::Thinking,
             model: "ollama/qwen3:14b".into(),
             effort: String::new(),
             context_percent: 35.0,
@@ -235,6 +440,9 @@ pub fn populate_demo(app: &mut App) {
             token_history: vec![
                 3000, 5000, 8000, 6000, 9000, 7000, 11000, 8000, 10000,
             ],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
@@ -242,6 +450,10 @@ pub fn populate_demo(app: &mut App) {
 
             first_assistant_text: String::new(),
             initial_prompt: "Refactor Terraform modules for multi-region".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
         },
     ];
 
@@ -289,10 +501,9 @@ pub fn populate_demo(app: &mut App) {
 
     // --- Token rates (synthetic sparkline) ---
     let rates = [
-        0.0, 0.0, 120.0, 340.0, 580.0, 420.0, 0.0, 0.0, 890.0, 1200.0,
-        950.0, 680.0, 0.0, 0.0, 450.0, 780.0, 1100.0, 1350.0, 920.0, 610.0,
-        0.0, 340.0, 670.0, 890.0, 1050.0, 780.0, 520.0, 0.0, 0.0, 1400.0,
-        1180.0, 850.0, 620.0, 410.0, 0.0, 560.0, 820.0, 1060.0, 1280.0, 940.0,
+        0.0, 0.0, 120.0, 340.0, 580.0, 420.0, 0.0, 0.0, 890.0, 1200.0, 950.0, 680.0, 0.0, 0.0,
+        450.0, 780.0, 1100.0, 1350.0, 920.0, 610.0, 0.0, 340.0, 670.0, 890.0, 1050.0, 780.0, 520.0,
+        0.0, 0.0, 1400.0, 1180.0, 850.0, 620.0, 410.0, 0.0, 560.0, 820.0, 1060.0, 1280.0, 940.0,
         700.0, 480.0, 0.0, 0.0, 380.0, 720.0, 1150.0, 1320.0, 980.0, 650.0,
     ];
     app.token_rates.clear();
@@ -301,12 +512,18 @@ pub fn populate_demo(app: &mut App) {
     }
 
     // --- Orphan ports ---
-    app.orphan_ports = vec![
-        OrphanPort {
-            port: 4000,
-            pid: 6543,
-            command: "node dist/server.js".into(),
-            project_name: "old-project".into(),
-        },
-    ];
+    app.orphan_ports = vec![OrphanPort {
+        port: 4000,
+        pid: 6543,
+        command: "node dist/server.js".into(),
+        project_name: "old-project".into(),
+    }];
+
+    // --- Host metrics + agent aggregate (demo values) ---
+    app.host_metrics = Some(crate::host_info::HostMetrics {
+        cpu_pct: 23.0,
+        mem_pct: 41.0,
+        load1: 1.8,
+    });
+    app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
 }

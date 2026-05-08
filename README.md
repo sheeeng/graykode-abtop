@@ -1,10 +1,11 @@
 # abtop
 
-**Like htop, but for your AI coding agents.**
+**Like [btop](https://github.com/aristocratos/btop), but for your AI coding agents.**
 
 See every Claude Code and Codex CLI session at a glance — token usage, context window %, rate limits, child processes, open ports, and more.
+Claude Code and Codex CLI sessions are discovered from local process/file state, so multiple active profiles are supported across macOS, Linux, and Windows.
 
-![demo](assets/demo.gif)
+![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
 ## Why
 
@@ -29,6 +30,16 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/graykode/abtop/releases
 cargo install abtop
 ```
 
+### Windows
+
+Native support — no WSL required. Uses `sysinfo` for process info and `netstat -ano` for listening ports.
+
+```powershell
+powershell -c "irm https://github.com/graykode/abtop/releases/latest/download/abtop-installer.ps1 | iex"
+```
+
+Or `cargo install abtop` from any terminal with Git in PATH. Claude Code config is resolved automatically from `%USERPROFILE%\.claude`.
+
 ### Other
 
 Pre-built binaries for all platforms are available on the [GitHub Releases](https://github.com/graykode/abtop/releases) page.
@@ -43,17 +54,6 @@ abtop --theme dracula    # Launch with a specific theme
 ```
 
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
-
-### Windows
-
-abtop requires Unix tools (`ps`, `lsof`) and is not supported natively on Windows. Use [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) instead:
-
-```bash
-wsl --install
-# Inside WSL:
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/graykode/abtop/releases/latest/download/abtop-installer.sh | sh
-abtop
-```
 
 ### tmux
 
@@ -84,27 +84,53 @@ tmux new -s work
 
 ## Themes
 
-10 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
+12 built-in themes, including 4 colorblind-friendly options (`high-contrast`, `protanopia`, `deuteranopia`, `tritanopia`). Press `t` to cycle at runtime, or launch with `--theme <name>`. Your choice is saved to `~/.config/abtop/config.toml`.
 
 | btop (default) | dracula | catppuccin |
 |:-:|:-:|:-:|
-| ![btop](assets/themes/btop.png) | ![dracula](assets/themes/dracula.png) | ![catppuccin](assets/themes/catppuccin.png) |
+| ![btop](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/btop.png) | ![dracula](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/dracula.png) | ![catppuccin](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/catppuccin.png) |
 
 | tokyo-night | gruvbox | nord |
 |:-:|:-:|:-:|
-| ![tokyo-night](assets/themes/tokyo-night.png) | ![gruvbox](assets/themes/gruvbox.png) | ![nord](assets/themes/nord.png) |
+| ![tokyo-night](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/tokyo-night.png) | ![gruvbox](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/gruvbox.png) | ![nord](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/nord.png) |
 
 Colorblind-friendly themes:
 
 | high-contrast | protanopia |
 |:-:|:-:|
-| ![high-contrast](assets/themes/high-contrast.png) | ![protanopia](assets/themes/protanopia.png) |
+| ![high-contrast](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/high-contrast.png) | ![protanopia](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/protanopia.png) |
 
 | deuteranopia | tritanopia |
 |:-:|:-:|
-| ![deuteranopia](assets/themes/deuteranopia.png) | ![tritanopia](assets/themes/tritanopia.png) |
+| ![deuteranopia](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/deuteranopia.png) | ![tritanopia](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/tritanopia.png) |
 
-Theme support contributed by [@tbouquet](https://github.com/tbouquet).
+Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) for bright terminals:
+
+| light | white |
+|:-:|:-:|
+| ![light](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/light.png) | ![white](https://raw.githubusercontent.com/graykode/abtop/main/assets/themes/white.png) |
+
+## Configuration
+
+`~/.config/abtop/config.toml` supports:
+
+```toml
+theme = "btop"
+# Hide specific agent CLIs from the TUI (case-insensitive).
+# Useful if you only use one agent and want a cleaner view.
+hidden_agents = ["codex"]
+# UI language. Omit or leave empty to auto-detect from LANG.
+language = "zh"
+```
+
+### Supported Languages
+
+| Code | Language            |
+| ---- | ------------------- |
+| `en` | English (default)   |
+| `zh` | Simplified Chinese  |
+
+When `language` is unset, abtop auto-detects from `LANG` — any value starting with `zh` switches to Simplified Chinese, otherwise English.
 
 ## Key Bindings
 
@@ -115,12 +141,18 @@ Theme support contributed by [@tbouquet](https://github.com/tbouquet).
 | `x`                | Kill selected session                |
 | `X`                | Kill all orphan ports                |
 | `t`                | Cycle theme                          |
+| `1`–`5`            | Toggle panel visibility              |
+| `Esc`              | Open/close config page               |
 | `q`                | Quit                                 |
 | `r`                | Force refresh                        |
 
 ## Privacy
 
-abtop reads local files only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
+abtop reads local files and local process/open-file metadata only. No API keys, no auth. Tool names and file paths are shown in the UI, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
+
+## Acknowledgements
+
+Huge thanks to [@tbouquet](https://github.com/tbouquet) for driving much of abtop's recent shape — themes, config overlay and panel toggles, session filtering, subagent tree view, the context window gauge with compaction detection, plus a steady stream of fixes and security hardening along the way.
 
 ## License
 
